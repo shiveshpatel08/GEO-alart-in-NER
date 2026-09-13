@@ -1,4 +1,3 @@
-from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import select
@@ -8,7 +7,7 @@ from app.core.auth import get_current_user
 from app.core.security import create_access_token, get_password_hash, verify_password
 from app.database import get_db
 from app.models import User
-from app.schemas import LoginRequest, Token, UserCreate, UserResponse
+from app.schemas import Token, UserCreate, UserResponse
 
 router = APIRouter(prefix="/auth", tags=["Control Room Authentication & Access Control"])
 
@@ -51,13 +50,12 @@ async def register_user(user_in: UserCreate, db: AsyncSession = Depends(get_db))
     description="Authenticates operator credentials and returns signed JWT Access Token.",
 )
 async def login(
-    login_data: Optional[LoginRequest] = None,
-    form_data: Optional[OAuth2PasswordRequestForm] = Depends(),
+    form_data: OAuth2PasswordRequestForm = Depends(),
     db: AsyncSession = Depends(get_db),
 ):
-    """Authenticates credentials from JSON body or OAuth2 Form and returns JWT token."""
-    email = login_data.email if login_data else (form_data.username if form_data else None)
-    password = login_data.password if login_data else (form_data.password if form_data else None)
+    """Authenticates credentials from OAuth2 Form and returns JWT token."""
+    email = form_data.username
+    password = form_data.password
 
     if not email or not password:
         raise HTTPException(
