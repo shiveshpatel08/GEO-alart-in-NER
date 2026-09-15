@@ -91,20 +91,30 @@ Before running the project, ensure you have installed:
    pip install -r requirements.txt
    ```
 
-3. **Configure Database Connection**:
-   Update your database connection string in `.env` or set the environment variable:
+3. **Configure Database Connection & Environment**:
+   Update your database connection string in `.env` or set the environment variables:
    ```env
    DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/geoalert_ner
+   SYNC_DATABASE_URL=postgresql+psycopg2://postgres:postgres@localhost:5432/geoalert_ner
+   SECRET_KEY=GEOALERT_NER_SECRET_CHANGE_IN_PROD
    DEFAULT_SRID=4326
+   CORS_ORIGINS=http://localhost:5173
+   ```
+   > In production, generate a secure 256-bit secret key using: `python scripts/generate_secret.py`
+
+4. **Run Database Migrations (Alembic)**:
+   Ensure your PostgreSQL instance is running with the PostGIS extension enabled (`CREATE EXTENSION IF NOT EXISTS postgis;`), then apply the schema migrations to head:
+   ```bash
+   alembic upgrade head
    ```
 
-4. **Seed Database & Enable PostGIS**:
-   Run the seed script to create database tables, activate the PostGIS extension, and populate realistic monitoring stations across NER states (Meghalaya, Sikkim, Mizoram, Nagaland, Manipur, Arunachal Pradesh):
+5. **Seed Database (Optional for Development)**:
+   Run the seed script to populate initial stations across NER states (Meghalaya, Sikkim, Mizoram, Nagaland, Manipur, Arunachal Pradesh):
    ```bash
    python scripts/seed_data.py
    ```
 
-5. **Start FastAPI Backend Server**:
+6. **Start FastAPI Backend Server**:
    ```bash
    uvicorn app.main:app --reload --port 8000
    ```
@@ -131,15 +141,44 @@ Before running the project, ensure you have installed:
    npm run dev
    ```
 
-4. **Access Dashboard**:
-   Open your browser and navigate to:
-   ```text
-   http://localhost:5173
+4. **Production Frontend Build**:
+   ```bash
+   npm run build
    ```
+   Compiles optimized production assets into `frontend/dist/`.
 
 ---
 
-### Step 3: Running Verification Tests
+### Step 3: Production Docker Deployment
+
+The project includes containerized deployment definitions (`Dockerfile`, `docker-compose.yml`, and `nginx/nginx.conf`).
+
+1. **Generate Production Configuration**:
+   ```bash
+   python scripts/generate_secret.py
+   cp .env.production.example .env.production
+   # Edit .env.production with your generated SECRET_KEY, DB credentials, and CORS_ORIGINS
+   ```
+
+2. **Build and Launch Container Stack**:
+   ```bash
+   docker compose --env-file .env.production up -d --build
+   ```
+
+3. **Architecture in Docker**:
+   - **Nginx Reverse Proxy** (`:80`): Serves compiled React SPA (`/frontend/dist`) and proxies `/api/` & `/docs` to FastAPI.
+   - **FastAPI API Server** (`:8000` internal): Handles IoT telemetry, risk evaluation, ML inference, and alerts.
+   - **PostGIS Database** (`:5432` internal, mapped to host `:5433` by default to avoid local port 5432 collisions): Spatial relational persistence.
+   - **Redis** (`:6379` internal): Message broker for telemetry and pub/sub alerts.
+
+4. **Rollback Guidance**:
+   - To roll back a migration: `alembic downgrade -1`
+   - To stop containers safely: `docker compose down`
+   - To rebuild after configuration adjustments: `docker compose up -d --build`
+
+---
+
+### Step 4: Running Verification Tests
 
 To verify all backend API routes, PostGIS spatial queries, and schema validations:
 

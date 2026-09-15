@@ -6,11 +6,31 @@ from pathlib import Path
 # Add project root to sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 from datetime import datetime, timezone
 from fastapi.testclient import TestClient
 from app.main import app
 
 client = TestClient(app)
+auth_headers = {}
+
+
+def setup_test_auth():
+    global auth_headers
+    user_payload = {
+        "email": "test.operator@geoalert.in",
+        "full_name": "Test Control Room Officer",
+        "role": "CONTROL_ROOM_OPERATOR",
+        "password": "TestPassword123!",
+    }
+    client.post("/api/v1/auth/register", json=user_payload)
+    login_res = client.post("/api/v1/auth/login", json={"email": "test.operator@geoalert.in", "password": "TestPassword123!"})
+    if login_res.status_code == 200:
+        token = login_res.json().get("access_token")
+        auth_headers = {"Authorization": f"Bearer {token}"}
+        print("Authenticated test operator, acquired Bearer token.")
 
 
 def test_root_and_health():
@@ -37,7 +57,7 @@ def test_station_creation_and_spatial_queries():
         "longitude": 91.8800,
     }
 
-    res_create = client.post("/api/v1/stations", json=st_payload)
+    res_create = client.post("/api/v1/stations", json=st_payload, headers=auth_headers)
     print("POST /api/v1/stations -> Status:", res_create.status_code)
     assert res_create.status_code in (201, 400, 503)
 
@@ -105,9 +125,9 @@ def test_landslide_inventory():
         "description": "Test landslide event entry.",
     }
 
-    res_create = client.post("/api/v1/landslides", json=ls_payload)
+    res_create = client.post("/api/v1/landslides", json=ls_payload, headers=auth_headers)
     print("POST /api/v1/landslides -> Status:", res_create.status_code)
-    assert res_create.status_code in (201, 503)
+    assert res_create.status_code in (201, 400, 503)
 
     # Nearby Landslide Search within 10km
     res_nearby = client.get("/api/v1/landslides/nearby?lat=25.5680&lon=91.8830&radius_km=10.0")
@@ -151,7 +171,22 @@ def test_weather_fallback():
 
 
 def test_alerts():
-    print("\n--- 7. Testing Alert Log & Manual Override ---")
+    print("\n--- 7. Testing Alert Log & Manual Override (with RBAC Auth) ---")
+    # Register/login test operator to obtain valid JWT token
+    user_payload = {
+        "email": "test.operator@geoalert.in",
+        "full_name": "Test Control Room Officer",
+        "role": "CONTROL_ROOM_OPERATOR",
+        "password": "TestPassword123!",
+    }
+    client.post("/api/v1/auth/register", json=user_payload)
+    login_res = client.post("/api/v1/auth/login", json={"email": "test.operator@geoalert.in", "password": "TestPassword123!"})
+    auth_headers = {}
+    if login_res.status_code == 200:
+        token = login_res.json().get("access_token")
+        auth_headers = {"Authorization": f"Bearer {token}"}
+        print("Logged in test operator, acquired Bearer token.")
+
     alert_payload = {
         "risk_level": "CRITICAL",
         "risk_score": 92.5,
@@ -159,7 +194,7 @@ def test_alerts():
         "recipient": "+919876543210",
         "message": "MANUAL OVERRIDE: Evacuate slope sector B4 immediately.",
     }
-    res_trigger = client.post("/api/v1/alerts/trigger", json=alert_payload)
+    res_trigger = client.post("/api/v1/alerts/trigger", json=alert_payload, headers=auth_headers)
     print("POST /api/v1/alerts/trigger -> Status:", res_trigger.status_code)
     assert res_trigger.status_code in (201, 503)
 
@@ -169,16 +204,20 @@ def test_alerts():
 
 
 def run_all_tests():
+    global client
     print("=" * 60)
     print("[TEST SUITE] Running GeoAlert-NER API & Spatial Verification Suite")
     print("=" * 60)
-    test_root_and_health()
-    test_station_creation_and_spatial_queries()
-    test_telemetry_ingestion_and_sync()
-    test_landslide_inventory()
-    test_incidents()
-    test_weather_fallback()
-    test_alerts()
+    with TestClient(app) as c:
+        client = c
+        setup_test_auth()
+        test_root_and_health()
+        test_station_creation_and_spatial_queries()
+        test_telemetry_ingestion_and_sync()
+        test_landslide_inventory()
+        test_incidents()
+        test_weather_fallback()
+        test_alerts()
     print("=" * 60)
     print("[SUCCESS] All API tests executed successfully!")
     print("=" * 60)

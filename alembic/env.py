@@ -18,8 +18,10 @@ from app.config import settings
 # Alembic Config object
 config = context.config
 
-# Set database URL from app settings
-config.set_main_option("sqlalchemy.url", settings.SYNC_DATABASE_URL)
+# Set database URL from app settings if not explicitly specified
+url_from_config = config.get_main_option("sqlalchemy.url")
+if not url_from_config or "driver://user:pass@localhost/dbname" in url_from_config:
+    config.set_main_option("sqlalchemy.url", settings.SYNC_DATABASE_URL)
 
 # Logging
 if config.config_file_name is not None:

@@ -8,13 +8,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
-from app.database import get_db
+from app.config import settings
+from app.database import AsyncSessionLocal, get_db
 from app.models import AlertLog, SensorStation, TelemetryData
 
 logger = logging.getLogger(__name__)
 
 # Redis connection (graceful fallback if unavailable)
-REDIS_URL = "redis://localhost:6379"
 _redis_client: Optional[aioredis.Redis] = None
 
 
@@ -22,7 +22,7 @@ async def get_redis() -> Optional[aioredis.Redis]:
     global _redis_client
     if _redis_client is None:
         try:
-            _redis_client = aioredis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=2)
+            _redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True, socket_connect_timeout=2)
             await _redis_client.ping()
         except Exception:
             _redis_client = None
@@ -59,39 +59,41 @@ router = APIRouter(prefix="/realtime", tags=["Real-time WebSocket & SSE Streamin
 
 
 @router.websocket("/ws/risk-map")
-async def websocket_risk_map(websocket: WebSocket, db: AsyncSession = Depends(get_db)):
+async def websocket_risk_map(websocket: WebSocket):
     """
     WebSocket endpoint for live GIS risk map updates.
     Streams updated risk scores for all active stations every 30 seconds.
+    Uses short-lived sessions per iteration to avoid connection pool starvation.
     """
     await manager.connect(websocket)
     try:
         while True:
-            # Fetch latest telemetry readings for all stations
-            result = await db.execute(
-                select(SensorStation).where(SensorStation.is_active == True).limit(50)
-            )
-            stations = result.scalars().all()
+            # Fetch latest telemetry readings for all stations using a short-lived session
             station_updates = []
-            for station in stations:
-                tel_res = await db.execute(
-                    select(TelemetryData)
-                    .where(TelemetryData.station_id == station.id)
-                    .order_by(TelemetryData.timestamp.desc())
-                    .limit(1)
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(SensorStation).where(SensorStation.is_active == True).limit(50)
                 )
-                latest_tel = tel_res.scalar_one_or_none()
-                if latest_tel:
-                    station_updates.append({
-                        "station_id": station.id,
-                        "station_code": station.code,
-                        "station_name": station.name,
-                        "soil_moisture": latest_tel.soil_moisture_percent,
-                        "rainfall_24h_mm": latest_tel.rainfall_24h_mm,
-                        "slope_tilt_deg": latest_tel.slope_tilt_deg,
-                        "insar_displacement_mm": latest_tel.insar_displacement_mm,
-                        "data_source": latest_tel.data_source,
-                    })
+                stations = result.scalars().all()
+                for station in stations:
+                    tel_res = await db.execute(
+                        select(TelemetryData)
+                        .where(TelemetryData.station_id == station.id)
+                        .order_by(TelemetryData.timestamp.desc())
+                        .limit(1)
+                    )
+                    latest_tel = tel_res.scalar_one_or_none()
+                    if latest_tel:
+                        station_updates.append({
+                            "station_id": station.id,
+                            "station_code": station.code,
+                            "station_name": station.name,
+                            "soil_moisture": latest_tel.soil_moisture_percent,
+                            "rainfall_24h_mm": latest_tel.rainfall_24h_mm,
+                            "slope_tilt_deg": latest_tel.slope_tilt_deg,
+                            "insar_displacement_mm": latest_tel.insar_displacement_mm,
+                            "data_source": latest_tel.data_source,
+                        })
 
             await websocket.send_json({
                 "event": "risk_map_update",
@@ -103,23 +105,38 @@ async def websocket_risk_map(websocket: WebSocket, db: AsyncSession = Depends(ge
         manager.disconnect(websocket)
 
 
-@router.get("/sse/alerts")
-async def sse_alert_feed(db: AsyncSession = Depends(get_db)):
+@router.get(
+    "/sse/alerts",
+    response_class=EventSourceResponse,
+    responses={
+        200: {
+            "content": {"text/event-stream": {}},
+            "description": "Server-Sent Events (SSE) live alert stream",
+        }
+    },
+    summary="Server-Sent Events (SSE) Live Alert Feed",
+    description="Pushes new CRITICAL and HIGH landslide disaster alerts to browser dashboard in real time.",
+)
+async def sse_alert_feed():
     """
     Server-Sent Events (SSE) stream for live alert feed.
     Pushes new CRITICAL/HIGH alerts to browser dashboard without page refresh.
+    Uses short-lived session per polling cycle inside the generator.
     """
     async def event_generator() -> AsyncGenerator:
         last_seen_id = 0
         while True:
-            result = await db.execute(
-                select(AlertLog)
-                .where(AlertLog.id > last_seen_id)
-                .where(AlertLog.risk_level.in_(["CRITICAL", "HIGH"]))
-                .order_by(AlertLog.sent_at.desc())
-                .limit(5)
-            )
-            new_alerts = result.scalars().all()
+            new_alerts = []
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(AlertLog)
+                    .where(AlertLog.id > last_seen_id)
+                    .where(AlertLog.risk_level.in_(["CRITICAL", "HIGH"]))
+                    .order_by(AlertLog.sent_at.desc())
+                    .limit(5)
+                )
+                new_alerts = result.scalars().all()
+
             for alert in new_alerts:
                 if alert.id > last_seen_id:
                     last_seen_id = alert.id

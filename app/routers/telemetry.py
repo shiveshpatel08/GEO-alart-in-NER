@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -8,11 +8,14 @@ from app.models import SensorStation, TelemetryData
 from app.schemas import (
     AntecedentRainfallResponse,
     TelemetryBatchSync,
+    TelemetryBatchSyncResponse,
     TelemetryCreate,
     TelemetryResponse,
+    WeatherFallbackResponse,
 )
 from app.services.alert_service import dispatch_alert
 from app.services.risk_engine import calculate_antecedent_rainfall, evaluate_station_risk
+from app.services.weather_fallback import fetch_open_meteo_precipitation
 
 router = APIRouter(prefix="/telemetry", tags=["Telemetry & IoT Ingestion"])
 
@@ -52,7 +55,7 @@ async def ingest_telemetry(
     await db.flush()
 
     # 3. Evaluate real-time landslide risk
-    score, level, reasons, _, _ = await evaluate_station_risk(db, station, telemetry)
+    score, level, reasons, _, _, _, _ = await evaluate_station_risk(db, station, telemetry)
 
     # 4. Trigger alert if CRITICAL or HIGH
     if level in ("CRITICAL", "HIGH"):
@@ -71,7 +74,7 @@ async def ingest_telemetry(
     return telemetry
 
 
-@router.post("/sync", status_code=status.HTTP_200_OK)
+@router.post("/sync", response_model=TelemetryBatchSyncResponse, status_code=status.HTTP_200_OK)
 async def sync_cached_telemetry(
     payload: TelemetryBatchSync,
     db: AsyncSession = Depends(get_db),
@@ -142,15 +145,25 @@ async def get_antecedent_rainfall(
     )
 
 
-@router.get("/weather-fallback")
+@router.get("/weather-fallback", response_model=WeatherFallbackResponse)
 async def get_weather_fallback_data(
-    lat: float = Query(..., ge=-90.0, le=90.0),
-    lon: float = Query(..., ge=-180.0, le=180.0),
+    lat: Optional[float] = Query(None, ge=-90.0, le=90.0),
+    lon: Optional[float] = Query(None, ge=-180.0, le=180.0),
+    latitude: Optional[float] = Query(None, ge=-90.0, le=90.0),
+    longitude: Optional[float] = Query(None, ge=-180.0, le=180.0),
 ):
     """
     Fetches live satellite + 7-day historical precipitation fallback data from Open-Meteo
     when ground sensor telemetry is missing or damaged during extreme storms.
+    Accepts both lat/lon and latitude/longitude parameters.
     """
-    return await fetch_open_meteo_precipitation(lat, lon)
+    target_lat = lat if lat is not None else latitude
+    target_lon = lon if lon is not None else longitude
+    if target_lat is None or target_lon is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Latitude and longitude parameters are required ('lat'/'lon' or 'latitude'/'longitude').",
+        )
+    return await fetch_open_meteo_precipitation(target_lat, target_lon)
 
 

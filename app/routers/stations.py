@@ -4,8 +4,9 @@ from sqlalchemy import cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from geoalchemy2 import Geography
 
+from app.core.auth import get_current_user, require_role
 from app.database import get_db
-from app.models import SensorStation
+from app.models import SensorStation, User
 from app.schemas import StationCreate, StationResponse
 
 router = APIRouter(prefix="/stations", tags=["Sensor Stations"])
@@ -57,6 +58,7 @@ async def list_stations(
 async def create_station(
     payload: StationCreate,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["ADMIN", "CONTROL_ROOM_OPERATOR"])),
 ):
     """Registers a new monitoring station with PostGIS ST_MakePoint geometry."""
     # Check if station code exists

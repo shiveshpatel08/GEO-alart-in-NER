@@ -51,7 +51,7 @@ async def evaluate_single_station_risk(
             slope_tilt_deg=0.0,
         )
 
-    score, level, reasons, antecedent, nearby_count = await evaluate_station_risk(
+    score, level, reasons, antecedent, nearby_count, rule_score, ml_prob = await evaluate_station_risk(
         db, station, latest_telemetry
     )
 
@@ -63,6 +63,8 @@ async def evaluate_single_station_risk(
         longitude=lon,
         risk_score=score,
         risk_level=level,
+        rule_based_score=rule_score,
+        ml_probability=ml_prob,
         current_soil_moisture=latest_telemetry.soil_moisture_percent,
         current_slope_tilt=latest_telemetry.slope_tilt_deg,
         rainfall_24h_mm=latest_telemetry.rainfall_24h_mm,
@@ -90,16 +92,22 @@ async def get_spatial_risk_map(db: AsyncSession = Depends(get_db)):
     result = await db.execute(stmt)
     rows = result.all()
 
+    station_ids = [station.id for station, _, _, _ in rows]
+    latest_telemetry_map = {}
+    if station_ids:
+        tel_batch_stmt = (
+            select(TelemetryData)
+            .distinct(TelemetryData.station_id)
+            .where(TelemetryData.station_id.in_(station_ids))
+            .order_by(TelemetryData.station_id, TelemetryData.timestamp.desc())
+        )
+        tel_batch_res = await db.execute(tel_batch_stmt)
+        for tel in tel_batch_res.scalars().all():
+            latest_telemetry_map[tel.station_id] = tel
+
     features = []
     for station, geojson_str, lon, lat in rows:
-        # Fetch latest telemetry
-        stmt_tel = (
-            select(TelemetryData)
-            .where(TelemetryData.station_id == station.id)
-            .order_by(TelemetryData.timestamp.desc())
-            .limit(1)
-        )
-        latest_telemetry = (await db.execute(stmt_tel)).scalar_one_or_none()
+        latest_telemetry = latest_telemetry_map.get(station.id)
 
         if not latest_telemetry:
             latest_telemetry = TelemetryData(
@@ -111,7 +119,7 @@ async def get_spatial_risk_map(db: AsyncSession = Depends(get_db)):
                 slope_tilt_deg=0.0,
             )
 
-        score, level, reasons, antecedent, nearby_count = await evaluate_station_risk(
+        score, level, reasons, antecedent, nearby_count, rule_score, ml_prob = await evaluate_station_risk(
             db, station, latest_telemetry
         )
 
@@ -128,10 +136,13 @@ async def get_spatial_risk_map(db: AsyncSession = Depends(get_db)):
                 "elevation_m": station.elevation_m,
                 "risk_score": score,
                 "risk_level": level,
+                "rule_based_score": rule_score,
+                "ml_probability": ml_prob,
                 "soil_moisture_percent": latest_telemetry.soil_moisture_percent,
                 "slope_tilt_deg": latest_telemetry.slope_tilt_deg,
                 "rainfall_24h_mm": latest_telemetry.rainfall_24h_mm,
                 "antecedent_3d_mm": antecedent["rainfall_3d_mm"],
+                "nearby_landslides_5km": nearby_count,
                 "trigger_reasons": reasons,
             },
         }

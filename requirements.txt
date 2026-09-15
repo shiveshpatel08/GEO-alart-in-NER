@@ -19,3 +19,4 @@ redis>=5.0.1
 fastapi-cache2>=0.2.1
 sse-starlette>=1.8.2
 alembic>=1.13.1
+python-multipart>=0.0.9

@@ -87,15 +87,15 @@ export const fetchAlertLogs = async () => {
 
 export const triggerManualAlert = async (payload) => {
   try {
-    const response = await axios.post(`${API_BASE_URL}/alerts/trigger`, payload);
+    const token = localStorage.getItem('geoalert_token');
+    const headers = token ? { Authorization: `Bearer ${token}` } : {};
+    const response = await axios.post(`${API_BASE_URL}/alerts/trigger`, payload, { headers });
     return response.data;
   } catch (err) {
-    return {
-      id: Date.now(),
-      ...payload,
-      sent_at: new Date().toISOString(),
-      status: 'SENT'
-    };
+    const detail = err.response?.data?.detail;
+    const msg = typeof detail === 'string' ? detail : (err.message || 'Alert dispatch failed');
+    console.error('Manual alert trigger rejected:', msg);
+    throw new Error(msg);
   }
 };
 

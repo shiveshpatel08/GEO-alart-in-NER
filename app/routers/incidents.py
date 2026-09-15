@@ -3,8 +3,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from geoalchemy2 import Geography
+from app.core.auth import get_current_user, require_role
 from app.database import get_db
-from app.models import IncidentReport
+from app.models import IncidentReport, User
 from app.schemas import (
     IncidentReportCreate,
     IncidentReportResponse,
@@ -130,6 +131,7 @@ async def update_incident_status(
     incident_id: int,
     payload: IncidentStatusUpdate,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["ADMIN", "CONTROL_ROOM_OPERATOR"])),
 ):
     """Updates the verification status of an incident report (PENDING, VERIFIED, RESOLVED)."""
     stmt = select(

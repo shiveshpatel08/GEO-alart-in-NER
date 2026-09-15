@@ -97,7 +97,10 @@ async def _fetch_open_meteo_hourly(
     return None
 
 
-async def run_open_meteo_ingestion(triggered_by: str = "SCHEDULER") -> DataIngestionLog:
+async def run_open_meteo_ingestion(
+    db: Optional[AsyncSession] = None,
+    triggered_by: str = "SCHEDULER"
+) -> DataIngestionLog:
     """
     Main ingestion pipeline entry point.
 
@@ -107,6 +110,7 @@ async def run_open_meteo_ingestion(triggered_by: str = "SCHEDULER") -> DataInges
     4. Logs the run result in DataIngestionLog.
 
     Args:
+        db: Optional active AsyncSession. If not provided, a new session is created.
         triggered_by: "SCHEDULER" | "MANUAL_API_TRIGGER" | "STARTUP"
 
     Returns:
@@ -114,113 +118,119 @@ async def run_open_meteo_ingestion(triggered_by: str = "SCHEDULER") -> DataInges
     """
     logger.info(f"[INGESTION] Starting Open-Meteo rainfall + soil moisture sync (triggered_by={triggered_by})")
 
-    async with AsyncSessionLocal() as db:
-        # Create a log entry for this run (status=RUNNING)
-        log = DataIngestionLog(
-            source_name="OPEN_METEO",
-            status="RUNNING",
-            triggered_by=triggered_by,
-            started_at=datetime.now(timezone.utc),
+    if db is not None:
+        return await _execute_open_meteo_ingestion(db, triggered_by)
+
+    async with AsyncSessionLocal() as session:
+        return await _execute_open_meteo_ingestion(session, triggered_by)
+
+
+async def _execute_open_meteo_ingestion(db: AsyncSession, triggered_by: str) -> DataIngestionLog:
+    # Create a log entry for this run (status=RUNNING)
+    log = DataIngestionLog(
+        source_name="OPEN_METEO",
+        status="RUNNING",
+        triggered_by=triggered_by,
+        started_at=datetime.now(timezone.utc),
+    )
+    db.add(log)
+    await db.flush()  # Get log.id without committing
+
+    try:
+        # 1. Fetch all active stations
+        stations_result = await db.execute(
+            select(SensorStation).where(SensorStation.is_active == True)
         )
-        db.add(log)
-        await db.flush()  # Get log.id without committing
+        stations = stations_result.scalars().all()
 
-        try:
-            # 1. Fetch all active stations
-            stations_result = await db.execute(
-                select(SensorStation).where(SensorStation.is_active == True)
-            )
-            stations = stations_result.scalars().all()
-
-            if not stations:
-                log.status = "SKIPPED"
-                log.error_message = "No active stations found in database."
-                log.completed_at = datetime.now(timezone.utc)
-                await db.commit()
-                logger.warning("[INGESTION] Open-Meteo skipped — no active stations found.")
-                return log
-
-            records_fetched = 0
-            records_inserted = 0
-            records_skipped = 0
-            now_utc = datetime.now(timezone.utc)
-
-            # 2. Fetch data for each station using a shared HTTP client
-            async with httpx.AsyncClient() as client:
-                for station in stations:
-                    # Extract lat/lon from PostGIS WKBElement geometry
-                    from geoalchemy2.shape import to_shape
-                    try:
-                        point = to_shape(station.location)
-                        lat, lon = point.y, point.x
-                    except Exception:
-                        logger.warning(f"[INGESTION] Could not parse geometry for station {station.code}, skipping.")
-                        records_skipped += 1
-                        continue
-
-                    # 3. Fetch Open-Meteo data
-                    meteo_data = await _fetch_open_meteo_hourly(client, lat, lon, past_days=1)
-
-                    if meteo_data is None:
-                        logger.warning(f"[INGESTION] No Open-Meteo data for station {station.code} ({lat}, {lon})")
-                        records_skipped += 1
-                        continue
-
-                    records_fetched += 1
-
-                    # 4. Check if we already inserted data for this station in the last hour
-                    # to avoid duplicate rows on re-trigger
-                    one_hour_ago = now_utc - timedelta(hours=1)
-                    existing = await db.execute(
-                        select(TelemetryData).where(
-                            TelemetryData.station_id == station.id,
-                            TelemetryData.data_source == DATA_SOURCE_OPEN_METEO,
-                            TelemetryData.timestamp >= one_hour_ago,
-                        )
-                    )
-                    if existing.scalar_one_or_none():
-                        logger.debug(f"[INGESTION] Skipping {station.code} — data already inserted in last hour.")
-                        records_skipped += 1
-                        continue
-
-                    # 5. Insert new TelemetryData row
-                    telemetry = TelemetryData(
-                        station_id=station.id,
-                        timestamp=now_utc,
-                        soil_moisture_percent=meteo_data["soil_moisture_percent"],
-                        rainfall_1h_mm=meteo_data["rainfall_1h_mm"],
-                        rainfall_24h_mm=meteo_data["rainfall_24h_mm"],
-                        slope_tilt_deg=0.0,   # Satellite data has no tilt reading
-                        battery_voltage=0.0,  # Not applicable for govt data source
-                        is_cached_sync=False,
-                        data_source=DATA_SOURCE_OPEN_METEO,
-                    )
-                    db.add(telemetry)
-                    records_inserted += 1
-                    logger.info(
-                        f"[INGESTION] ✓ {station.code} ({station.state}): "
-                        f"rain_24h={meteo_data['rainfall_24h_mm']}mm, "
-                        f"soil={meteo_data['soil_moisture_percent']}%"
-                    )
-
-            # 6. Update log with results
-            log.status = "SUCCESS"
-            log.records_fetched = records_fetched
-            log.records_inserted = records_inserted
-            log.records_skipped = records_skipped
+        if not stations:
+            log.status = "SKIPPED"
+            log.error_message = "No active stations found in database."
             log.completed_at = datetime.now(timezone.utc)
             await db.commit()
+            logger.warning("[INGESTION] Open-Meteo skipped — no active stations found.")
+            return log
 
-            logger.info(
-                f"[INGESTION] Open-Meteo sync complete — "
-                f"fetched={records_fetched}, inserted={records_inserted}, skipped={records_skipped}"
-            )
+        records_fetched = 0
+        records_inserted = 0
+        records_skipped = 0
+        now_utc = datetime.now(timezone.utc)
 
-        except Exception as exc:
-            log.status = "FAILED"
-            log.error_message = str(exc)[:500]
-            log.completed_at = datetime.now(timezone.utc)
-            await db.commit()
-            logger.error(f"[INGESTION] Open-Meteo sync FAILED: {exc}", exc_info=True)
+        # 2. Fetch data for each station using a shared HTTP client
+        async with httpx.AsyncClient() as client:
+            for station in stations:
+                # Extract lat/lon from PostGIS WKBElement geometry
+                from app.services.risk_engine import extract_point_coordinates
+                coords = extract_point_coordinates(station.location)
+                if not coords:
+                    logger.warning(f"[INGESTION] Could not parse geometry for station {station.code}, skipping.")
+                    records_skipped += 1
+                    continue
+                lon, lat = coords
 
-        return log
+                # 3. Fetch Open-Meteo data
+                meteo_data = await _fetch_open_meteo_hourly(client, lat, lon, past_days=1)
+
+                if meteo_data is None:
+                    logger.warning(f"[INGESTION] No Open-Meteo data for station {station.code} ({lat}, {lon})")
+                    records_skipped += 1
+                    continue
+
+                records_fetched += 1
+
+                # 4. Check if we already inserted data for this station in the last hour
+                # to avoid duplicate rows on re-trigger
+                one_hour_ago = now_utc - timedelta(hours=1)
+                existing = await db.execute(
+                    select(TelemetryData).where(
+                        TelemetryData.station_id == station.id,
+                        TelemetryData.data_source == DATA_SOURCE_OPEN_METEO,
+                        TelemetryData.timestamp >= one_hour_ago,
+                    )
+                )
+                if existing.scalar_one_or_none():
+                    logger.debug(f"[INGESTION] Skipping {station.code} — data already inserted in last hour.")
+                    records_skipped += 1
+                    continue
+
+                # 5. Insert new TelemetryData row
+                telemetry = TelemetryData(
+                    station_id=station.id,
+                    timestamp=now_utc,
+                    soil_moisture_percent=meteo_data["soil_moisture_percent"],
+                    rainfall_1h_mm=meteo_data["rainfall_1h_mm"],
+                    rainfall_24h_mm=meteo_data["rainfall_24h_mm"],
+                    slope_tilt_deg=0.0,   # Satellite data has no tilt reading
+                    battery_voltage=0.0,  # Not applicable for govt data source
+                    is_cached_sync=False,
+                    data_source=DATA_SOURCE_OPEN_METEO,
+                )
+                db.add(telemetry)
+                records_inserted += 1
+                logger.info(
+                    f"[INGESTION] ✓ {station.code} ({station.state}): "
+                    f"rain_24h={meteo_data['rainfall_24h_mm']}mm, "
+                    f"soil={meteo_data['soil_moisture_percent']}%"
+                )
+
+        # 6. Update log with results
+        log.status = "SUCCESS"
+        log.records_fetched = records_fetched
+        log.records_inserted = records_inserted
+        log.records_skipped = records_skipped
+        log.completed_at = datetime.now(timezone.utc)
+        await db.commit()
+
+        logger.info(
+            f"[INGESTION] Open-Meteo sync complete — "
+            f"fetched={records_fetched}, inserted={records_inserted}, skipped={records_skipped}"
+        )
+
+    except Exception as exc:
+        log.status = "FAILED"
+        log.error_message = str(exc)[:500]
+        log.completed_at = datetime.now(timezone.utc)
+        await db.commit()
+        logger.error(f"[INGESTION] Open-Meteo sync FAILED: {exc}", exc_info=True)
+
+    return log

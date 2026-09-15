@@ -4,8 +4,9 @@ from sqlalchemy import cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from geoalchemy2 import Geography
 
+from app.core.auth import get_current_user, require_role
 from app.database import get_db
-from app.models import LandslideEvent
+from app.models import LandslideEvent, User
 from app.schemas import LandslideEventCreate, LandslideEventResponse
 
 router = APIRouter(prefix="/landslides", tags=["Historical Landslide Inventory"])
@@ -63,6 +64,7 @@ async def list_landslide_events(
 async def create_landslide_event(
     payload: LandslideEventCreate,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["ADMIN", "CONTROL_ROOM_OPERATOR"])),
 ):
     """Registers a historical or new landslide inventory event in PostGIS."""
     geom_point = func.ST_SetSRID(func.ST_MakePoint(payload.longitude, payload.latitude), 4326)

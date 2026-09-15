@@ -1,6 +1,6 @@
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import get_current_user, require_role
@@ -74,6 +74,13 @@ async def trigger_manual_alert(
 
 @router.get(
     "/{alert_id}/cap.xml",
+    response_class=Response,
+    responses={
+        200: {
+            "content": {"application/xml": {}},
+            "description": "OASIS Common Alerting Protocol (CAP v1.2) XML broadcast document",
+        }
+    },
     summary="Export NDMA CAP 1.2 XML Broadcast Feed",
     description="Generates OASIS Common Alerting Protocol (CAP v1.2) XML compliant document for NDMA Sachet Disaster Broadcast Portal.",
 )
@@ -94,10 +101,19 @@ async def get_alert_ndma_cap_xml(
     station_name = "North Eastern Region Monitoring Zone"
     lat, lon = 25.5686, 91.8833
     if alert_log.station_id:
-        st_res = await db.execute(select(SensorStation).where(SensorStation.id == alert_log.station_id))
-        st = st_res.scalar_one_or_none()
-        if st:
+        st_res = await db.execute(
+            select(
+                SensorStation,
+                func.ST_Y(SensorStation.location).label("lat"),
+                func.ST_X(SensorStation.location).label("lon"),
+            ).where(SensorStation.id == alert_log.station_id)
+        )
+        row = st_res.first()
+        if row:
+            st, st_lat, st_lon = row
             station_name = st.name
+            if st_lat is not None and st_lon is not None:
+                lat, lon = float(st_lat), float(st_lon)
 
     alert_data = {
         "id": alert_log.id,

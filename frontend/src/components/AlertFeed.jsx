@@ -6,20 +6,30 @@ export default function AlertFeed({ alerts = [], onTriggerManualAlert }) {
   const [message, setMessage] = useState('MANUAL EMERGENCY OVERRIDE: Evacuate slope Sector B4 immediately due to heavy rainfall.');
   const [channel, setChannel] = useState('SMS');
   const [isSending, setIsSending] = useState(false);
+  const [errorMessage, setErrorMessage] = useState(null);
+  const [successMessage, setSuccessMessage] = useState(null);
 
   const handleSendAlert = async (e) => {
     e.preventDefault();
     if (!message || !recipient) return;
 
+    setErrorMessage(null);
+    setSuccessMessage(null);
     setIsSending(true);
-    await onTriggerManualAlert({
-      risk_level: 'CRITICAL',
-      risk_score: 95.0,
-      channel,
-      recipient,
-      message
-    });
-    setIsSending(false);
+    try {
+      await onTriggerManualAlert({
+        risk_level: 'CRITICAL',
+        risk_score: 95.0,
+        channel,
+        recipient,
+        message
+      });
+      setSuccessMessage('Disaster alert successfully authorized and dispatched.');
+    } catch (err) {
+      setErrorMessage(err.message || 'Alert dispatch failed: Unauthorized or service error.');
+    } finally {
+      setIsSending(false);
+    }
   };
 
   return (
@@ -79,6 +89,16 @@ export default function AlertFeed({ alerts = [], onTriggerManualAlert }) {
         </div>
 
         <form onSubmit={handleSendAlert} style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+          {errorMessage && (
+            <div style={{ padding: '10px 14px', background: 'rgba(239, 68, 68, 0.15)', border: '1px solid rgba(239, 68, 68, 0.4)', borderRadius: '8px', color: '#fca5a5', fontSize: '0.85rem' }}>
+              ⚠️ {errorMessage}
+            </div>
+          )}
+          {successMessage && (
+            <div style={{ padding: '10px 14px', background: 'rgba(16, 185, 129, 0.15)', border: '1px solid rgba(16, 185, 129, 0.4)', borderRadius: '8px', color: '#6ee7b7', fontSize: '0.85rem' }}>
+              ✓ {successMessage}
+            </div>
+          )}
           
           <div>
             <label style={{ fontSize: '0.8rem', color: 'var(--text-muted)', display: 'block', marginBottom: '4px' }}>

@@ -1,6 +1,14 @@
 from datetime import datetime
-from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Annotated, Any, Dict, List, Literal, Optional
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+
+EMAIL_REGEX = r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"
+
+try:
+    import email_validator  # noqa: F401
+    from pydantic import EmailStr
+except ImportError:
+    EmailStr = Annotated[str, StringConstraints(pattern=EMAIL_REGEX, strip_whitespace=True)]
 
 
 # --- Station Schemas ---
@@ -32,11 +40,11 @@ class StationResponse(StationBase):
 class TelemetryCreate(BaseModel):
     station_code: str = Field(..., example="NER-STN-SHL-01")
     timestamp: Optional[datetime] = None
-    soil_moisture_percent: float = Field(..., ge=0.0, le=100.0, example=78.5)
-    rainfall_1h_mm: float = Field(0.0, ge=0.0, example=12.4)
-    rainfall_24h_mm: float = Field(0.0, ge=0.0, example=65.0)
-    slope_tilt_deg: float = Field(0.0, example=2.1)
-    battery_voltage: float = Field(3.7, example=4.1)
+    soil_moisture_percent: float = Field(..., ge=0.0, le=100.0, strict=True, example=78.5)
+    rainfall_1h_mm: float = Field(0.0, ge=0.0, strict=True, example=12.4)
+    rainfall_24h_mm: float = Field(0.0, ge=0.0, strict=True, example=65.0)
+    slope_tilt_deg: float = Field(0.0, strict=True, example=2.1)
+    battery_voltage: float = Field(3.7, strict=True, example=4.1)
     is_cached_sync: bool = Field(False, description="True if telemetry synced from ESP32 SD card after network reconnection")
 
 
@@ -50,6 +58,7 @@ class TelemetryResponse(BaseModel):
     slope_tilt_deg: float
     battery_voltage: float
     is_cached_sync: bool
+    data_source: str = "MANUAL"
     insar_displacement_mm: float = 0.0
 
     model_config = ConfigDict(from_attributes=True)
@@ -59,12 +68,28 @@ class TelemetryBatchSync(BaseModel):
     telemetries: List[TelemetryCreate]
 
 
+class TelemetryBatchSyncResponse(BaseModel):
+    status: str = Field("success", example="success")
+    synced_records: int = Field(..., example=10)
+
+
 class AntecedentRainfallResponse(BaseModel):
     station_id: int
     station_code: str
     rainfall_3d_mm: float
     rainfall_5d_mm: float
     rainfall_7d_mm: float
+
+
+class WeatherFallbackResponse(BaseModel):
+    source: str = Field(..., example="OPEN_METEO_SATELLITE", description="Data source provider: OPEN_METEO_SATELLITE | OFFLINE_FALLBACK_ESTIMATE")
+    latitude: float = Field(..., ge=-90.0, le=90.0, example=25.5686)
+    longitude: float = Field(..., ge=-180.0, le=180.0, example=91.8833)
+    rainfall_24h_mm: float = Field(..., ge=0.0, example=18.5, description="Cumulative 24-hour precipitation in mm")
+    rainfall_3d_mm: float = Field(..., ge=0.0, example=52.0, description="Cumulative 3-day antecedent precipitation in mm")
+    rainfall_7d_mm: float = Field(..., ge=0.0, example=110.4, description="Cumulative 7-day antecedent precipitation in mm")
+    estimated_soil_moisture_percent: float = Field(..., ge=0.0, le=100.0, example=74.2, description="Estimated soil saturation percentage (0-7cm depth)")
+    is_fallback: bool = Field(True, description="True indicates satellite/weather fallback estimation")
 
 
 # --- Landslide Inventory Schemas ---
@@ -99,15 +124,17 @@ class RiskEvaluationResponse(BaseModel):
     station_name: str
     latitude: float
     longitude: float
-    risk_score: float = Field(..., description="Calculated composite risk score (0 - 100)")
+    risk_score: float = Field(..., description="Hybrid composite risk score (0-100): 60% rule-based + 40% ML")
     risk_level: str = Field(..., description="LOW | MEDIUM | HIGH | CRITICAL")
+    rule_based_score: float = Field(..., description="Independent rule-based score (0-100) from soil moisture, rainfall, tilt, spatial proximity — verification layer independent of ML")
+    ml_probability: float = Field(..., description="Raw ML model failure probability (0.0-1.0) from Random Forest classifier")
     current_soil_moisture: float
     current_slope_tilt: float
     rainfall_24h_mm: float
     antecedent_rainfall_3d_mm: float
     antecedent_rainfall_7d_mm: float
     nearby_landslides_5km_count: int
-    trigger_reasons: List[str]
+    trigger_reasons: List[str] = Field(..., description="Human-readable reasons why this risk score was triggered — independent verification of score")
     evaluated_at: datetime
 
 
@@ -125,9 +152,9 @@ class GeoJSONFeatureCollection(BaseModel):
 # --- Alert Schemas ---
 class AlertCreate(BaseModel):
     station_id: Optional[int] = None
-    risk_level: str = Field(..., example="CRITICAL")
+    risk_level: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL", "ADVISORY", "WATCH", "WARNING", "EMERGENCY"] = Field(..., example="CRITICAL")
     risk_score: float = Field(..., example=88.5)
-    channel: str = Field("SMS", example="WHATSAPP", description="SMS | WHATSAPP | FCM | SYSTEM")
+    channel: Literal["SYSTEM", "SMS", "WHATSAPP", "FCM"] = Field("SMS", example="WHATSAPP", description="SMS | WHATSAPP | FCM | SYSTEM")
     recipient: str = Field(..., example="+919876543210")
     message: str = Field(..., example="CRITICAL LANDSLIDE WARNING: High moisture & tilt detected at Shillong Peak Station.")
 
@@ -162,7 +189,7 @@ class IncidentReportCreate(IncidentReportBase):
 
 
 class IncidentStatusUpdate(BaseModel):
-    status: str = Field(..., example="VERIFIED", description="PENDING | VERIFIED | RESOLVED")
+    status: Literal["PENDING", "VERIFIED", "RESOLVED", "REJECTED"] = Field(..., example="VERIFIED", description="PENDING | VERIFIED | RESOLVED | REJECTED")
 
 
 class IncidentReportResponse(IncidentReportBase):
@@ -219,7 +246,7 @@ class MLRetrainResponse(BaseModel):
 
 # --- Authentication & User Schemas ---
 class UserBase(BaseModel):
-    email: str = Field(..., example="operator.shillong@geoalert.in")
+    email: EmailStr = Field(..., example="operator.shillong@geoalert.in")
     full_name: str = Field(..., example="Control Room Officer Shillong")
     role: str = Field("CONTROL_ROOM_OPERATOR", example="CONTROL_ROOM_OPERATOR", description="ADMIN | CONTROL_ROOM_OPERATOR | PUBLIC")
     state_jurisdiction: Optional[str] = Field(None, example="Meghalaya")
@@ -238,8 +265,11 @@ class UserResponse(UserBase):
 
 
 class LoginRequest(BaseModel):
-    email: str = Field(..., example="operator.shillong@geoalert.in")
+    username: Optional[str] = Field(None, example="operator.shillong@geoalert.in")
+    email: Optional[str] = Field(None, example="operator.shillong@geoalert.in")
     password: str = Field(..., example="SecurePassword123!")
+
+    model_config = ConfigDict(extra="ignore")
 
 
 class Token(BaseModel):

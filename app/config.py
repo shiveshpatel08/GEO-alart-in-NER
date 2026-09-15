@@ -10,6 +10,9 @@ class Settings(BaseSettings):
     # Default fallback to localhost if not specified in environment
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/geoalert_ner"
     SYNC_DATABASE_URL: str = "postgresql+psycopg2://postgres:postgres@localhost:5432/geoalert_ner"
+    REDIS_URL: str = "redis://localhost:6379"
+    SECRET_KEY: str = "GEOALERT_NER_SECRET_CHANGE_IN_PROD"
+    CORS_ORIGINS: str = ""
 
     # Spatial configuration
     DEFAULT_SRID: int = 4326  # WGS 84

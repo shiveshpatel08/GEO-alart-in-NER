@@ -1,6 +1,7 @@
 import json
 import logging
 import math
+import struct
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -134,49 +135,99 @@ ml_engine = LandslideMLInferenceEngine()
 async def calculate_antecedent_rainfall(
     db: AsyncSession, station_id: int
 ) -> Dict[str, float]:
-    """Computes 3-day, 5-day, and 7-day cumulative antecedent rainfall for a sensor station."""
+    """
+    Computes 3-day, 5-day, and 7-day cumulative antecedent rainfall for a sensor station.
+    To prevent repeatedly summing rolling 24h totals when readings are frequent,
+    we compute distinct daily maximums grouped by calendar day (date_trunc).
+    If hourly incremental precipitation (rainfall_1h_mm) is present, it is also supported.
+    """
     now = datetime.now(timezone.utc)
     d3 = now - timedelta(days=3)
     d5 = now - timedelta(days=5)
     d7 = now - timedelta(days=7)
 
-    stmt_3d = select(func.coalesce(func.sum(TelemetryData.rainfall_24h_mm), 0.0)).where(
-        TelemetryData.station_id == station_id,
-        TelemetryData.timestamp >= d3,
-    )
-    stmt_5d = select(func.coalesce(func.sum(TelemetryData.rainfall_24h_mm), 0.0)).where(
-        TelemetryData.station_id == station_id,
-        TelemetryData.timestamp >= d5,
-    )
-    stmt_7d = select(func.coalesce(func.sum(TelemetryData.rainfall_24h_mm), 0.0)).where(
-        TelemetryData.station_id == station_id,
-        TelemetryData.timestamp >= d7,
-    )
+    async def get_cumulative_rain(since_dt: datetime) -> float:
+        # Check if hourly incremental rain is populated
+        h_stmt = select(func.coalesce(func.sum(TelemetryData.rainfall_1h_mm), 0.0)).where(
+            TelemetryData.station_id == station_id,
+            TelemetryData.timestamp >= since_dt,
+        )
+        h_sum = float((await db.execute(h_stmt)).scalar_one())
 
-    r3 = (await db.execute(stmt_3d)).scalar_one()
-    r5 = (await db.execute(stmt_5d)).scalar_one()
-    r7 = (await db.execute(stmt_7d)).scalar_one()
+        # Subquery for distinct daily maximums of rainfall_24h_mm
+        day_trunc = func.date_trunc("day", TelemetryData.timestamp)
+        daily_subquery = (
+            select(func.max(TelemetryData.rainfall_24h_mm).label("daily_max"))
+            .where(
+                TelemetryData.station_id == station_id,
+                TelemetryData.timestamp >= since_dt,
+            )
+            .group_by(day_trunc)
+            .subquery()
+        )
+        daily_sum_stmt = select(func.coalesce(func.sum(daily_subquery.c.daily_max), 0.0))
+        daily_sum = float((await db.execute(daily_sum_stmt)).scalar_one())
+
+        # Use distinct daily sum or hourly sum (whichever is non-zero)
+        return round(max(h_sum, daily_sum), 1)
+
+    r3 = await get_cumulative_rain(d3)
+    r5 = await get_cumulative_rain(d5)
+    r7 = await get_cumulative_rain(d7)
 
     return {
-        "rainfall_3d_mm": float(r3),
-        "rainfall_5d_mm": float(r5),
-        "rainfall_7d_mm": float(r7),
+        "rainfall_3d_mm": r3,
+        "rainfall_5d_mm": r5,
+        "rainfall_7d_mm": r7,
     }
+
+
+def extract_point_coordinates(geom) -> Optional[Tuple[float, float]]:
+    """Extracts (lon, lat) from WKBElement, EWKB bytes/hex without external shapely dependency."""
+    try:
+        if hasattr(geom, "data"):
+            data = bytes.fromhex(geom.data) if isinstance(geom.data, str) else bytes(geom.data)
+        elif isinstance(geom, (bytes, bytearray)):
+            data = bytes(geom)
+        elif isinstance(geom, str):
+            data = bytes.fromhex(geom)
+        else:
+            return None
+
+        endian = "<" if data[0] == 1 else ">"
+        geom_type = struct.unpack(endian + "I", data[1:5])[0]
+        has_srid = bool(geom_type & 0x20000000)
+        offset = 9 if has_srid else 5
+        x, y = struct.unpack(endian + "dd", data[offset:offset + 16])
+        return float(x), float(y)
+    except Exception:
+        return None
 
 
 async def count_nearby_landslides_postgis(
     db: AsyncSession, station_location_geom, radius_meters: float = 5000.0
 ) -> int:
     """Leverages PostGIS native geography ST_DWithin function to count past landslides."""
-    stmt = select(func.count(LandslideEvent.id)).where(
-        func.ST_DWithin(
-            cast(LandslideEvent.location, Geography),
-            cast(station_location_geom, Geography),
-            radius_meters,
+    try:
+        coords = extract_point_coordinates(station_location_geom)
+        if coords:
+            lon, lat = coords
+            point_geom = func.ST_SetSRID(func.ST_MakePoint(lon, lat), 4326)
+        else:
+            point_geom = station_location_geom
+
+        stmt = select(func.count(LandslideEvent.id)).where(
+            func.ST_DWithin(
+                cast(LandslideEvent.location, Geography),
+                cast(point_geom, Geography),
+                radius_meters,
+            )
         )
-    )
-    result = await db.execute(stmt)
-    return int(result.scalar_one())
+        result = await db.execute(stmt)
+        return int(result.scalar_one())
+    except Exception as exc:
+        logger.warning(f"Error counting nearby landslides: {exc}")
+        return 0
 
 
 async def evaluate_station_risk(
@@ -201,8 +252,14 @@ async def evaluate_station_risk(
 
     # 2. Antecedent rainfall score
     rainfall_data = await calculate_antecedent_rainfall(db, station.id)
-    r3d = rainfall_data["rainfall_3d_mm"] + latest_telemetry.rainfall_24h_mm
-    r7d = rainfall_data["rainfall_7d_mm"] + latest_telemetry.rainfall_24h_mm
+    # If latest_telemetry was not yet persisted to the database (id is None), add it;
+    # otherwise it is already included in rainfall_data
+    if latest_telemetry.id is None:
+        r3d = round(rainfall_data["rainfall_3d_mm"] + latest_telemetry.rainfall_24h_mm, 1)
+        r7d = round(rainfall_data["rainfall_7d_mm"] + latest_telemetry.rainfall_24h_mm, 1)
+    else:
+        r3d = rainfall_data["rainfall_3d_mm"]
+        r7d = rainfall_data["rainfall_7d_mm"]
 
     if r3d > 150.0:
         rainfall_score = 35.0
@@ -266,4 +323,5 @@ async def evaluate_station_risk(
     else:
         risk_level = "LOW"
 
-    return total_score, risk_level, trigger_reasons, rainfall_data, nearby_count
+    return total_score, risk_level, trigger_reasons, rainfall_data, nearby_count, round(rule_score, 1), round(ml_probability, 4)
+
